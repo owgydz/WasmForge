@@ -454,166 +454,348 @@ class TL {
     loadState(s){this.tracks=s.tracks;this.zoom=s.zoom;this.clipId=s.clipId;this.selectedClip=null;this.render()}
 }
 
-// =====================================================================
-// EXPORTER — all fetch-based, no <script> injection
-// =====================================================================
+
+
 class Exporter {
-    constructor(app){this.app=app;this.ffmpeg=null;this.ready=false;this.loading=false}
 
-    async loadFFmpeg(){
-        if(this.ready)return true;
-        if(this.loading)return new Promise(r=>{const iv=setInterval(()=>{if(!this.loading){clearInterval(iv);r(this.ready)}},200)});
-        this.loading=true;
-        const st=document.getElementById('ffmpegStatus');
-        st.className='ffmpeg-status loading';
-        st.innerHTML='<i class="fas fa-spinner fa-spin"></i> Loading FFmpeg.wasm (~25MB)...';
 
-        try{
-            // Step 1: fetch the ffmpeg wrapper JS via fetch+blob (avoids cross-origin script block)
-            const ffmpegJS=await fetch('https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js').then(r=>{if(!r.ok)throw new Error('Failed to fetch ffmpeg.js');return r.text()});
-            const utilJS=await fetch('https://unpkg.com/@ffmpeg/util@0.12.1/dist/umd/util.js').then(r=>{if(!r.ok)throw new Error('Failed to fetch util.js');return r.text()});
+    constructor(app) {
+        this.app = app;
 
-            // Execute in global scope via blob URL
-            const execScript=(code)=>new Promise((res,rej)=>{
-                const blob=new Blob([code],{type:'application/javascript'});
-                const url=URL.createObjectURL(blob);
-                const s=document.createElement('script');
-                s.src=url;s.onload=()=>{URL.revokeObjectURL(url);res()};s.onerror=rej;
-                document.head.appendChild(s);
+        this.ffmpeg = null;
+        this.ready = false;
+        this.loading = false;
+
+        // Do not fetch, use local third_party path.
+        this.basePath = "/third_party/ffmpeg";
+    }
+
+    // Loads FFmpeg.wasm from local third_party folder.
+    // Returns true on success.
+    async loadFFmpeg() {
+
+        if (this.ready) return true;
+        if (this.loading) return false;
+
+        this.loading = true;
+
+        const status = document.getElementById("ffmpegStatus");
+
+        const setStatus = (cls, msg) => {
+            if (!status) return;
+            status.className = `ffmpeg-status ${cls}`;
+            status.innerHTML = msg;
+        };
+
+        try {
+
+            if (location.protocol === "file:") {
+                throw new Error("Use a local server (not file://)");
+            }
+
+            setStatus("loading",
+                '<i class="fas fa-spinner fa-spin"></i> Loading FFmpeg...');
+
+            // Load ffmpeg.js locally if needed.
+            if (!window.FFmpegWASM && !window.FFmpeg) {
+                await new Promise((resolve, reject) => {
+                    const s = document.createElement("script");
+                    s.src = `${this.basePath}/ffmpeg.js`;
+                    s.onload = resolve;
+                    s.onerror = reject;
+                    document.head.appendChild(s);
+                });
+            }
+
+            const { FFmpeg } = window.FFmpegWASM || window;
+
+            if (!FFmpeg) {
+                throw new Error("FFmpeg global not found");
+            }
+
+            this.ffmpeg = new FFmpeg();
+
+            // Logging hook.
+            this.ffmpeg.on("log", ({ message }) => {
+                const log = document.getElementById("exportLog");
+                if (!log) return;
+                log.textContent += message + "\n";
+                log.scrollTop = log.scrollHeight;
             });
 
-            await execScript(ffmpegJS);
-            await execScript(utilJS);
-
-            // Step 2: fetch ffmpeg-core.js as blob URL for the Worker
-            const baseURL='https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
-            const coreJS=await fetch(baseURL+'/ffmpeg-core.js').then(r=>{if(!r.ok)throw new Error('Failed to fetch core');return r.text()});
-            const coreBlob=new Blob([coreJS],{type:'application/javascript'});
-            const coreURL=URL.createObjectURL(coreBlob);
-            const wasmURL=baseURL+'/ffmpeg-core.wasm';
-
-            // Step 3: also fetch the worker JS (814.ffmpeg.js) as blob
-            const workerJS=await fetch('https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/814.ffmpeg.js').then(r=>{if(!r.ok)throw new Error('Failed to fetch worker');return r.text()});
-            const workerBlob=new Blob([workerJS],{type:'application/javascript'});
-            const workerURL=URL.createObjectURL(workerBlob);
-
-            const{FFmpeg}=FFmpegWASM;
-            this.ffmpeg=new FFmpeg();
-
-            this.ffmpeg.on('log',({message})=>{
-                const log=document.getElementById('exportLog');
-                if(log){log.textContent+=message+'\n';log.scrollTop=log.scrollHeight}
-            });
-            this.ffmpeg.on('progress',({progress})=>{
-                if(progress>0&&progress<=1){
-                    const fill=document.getElementById('exportProgressFill');
-                    const txt=document.getElementById('exportProgressText');
-                    const pct=50+Math.round(progress*50);
-                    if(fill)fill.style.width=pct+'%';
-                    if(txt)txt.textContent=pct+'% encoding'
+            // Encoding progress hook.
+            this.ffmpeg.on("progress", ({ progress }) => {
+                if (progress > 0 && progress <= 1) {
+                    const fill = document.getElementById("exportProgressFill");
+                    const txt = document.getElementById("exportProgressText");
+                    const pct = 50 + Math.round(progress * 50);
+                    if (fill) fill.style.width = pct + "%";
+                    if (txt) txt.textContent = pct + "% encoding";
                 }
             });
 
-            await this.ffmpeg.load({coreURL,wasmURL,workerURL});
+            await this.ffmpeg.load({
+                coreURL: `${this.basePath}/ffmpeg-core.js`,
+                wasmURL: `${this.basePath}/ffmpeg-core.wasm`
+            });
 
-            URL.revokeObjectURL(coreURL);
-            URL.revokeObjectURL(workerURL);
+            this.ready = true;
 
-            this.ready=true;
-            st.className='ffmpeg-status ready';
-            st.innerHTML='<i class="fas fa-check-circle"></i> FFmpeg ready — all formats available'
-        }catch(err){
-            console.warn('FFmpeg load error:',err);
-            st.className='ffmpeg-status err';
-            st.innerHTML='<i class="fas fa-exclamation-triangle"></i> FFmpeg unavailable: '+String(err.message||err).substring(0,80)+'. Use WebM Fast.'
+            setStatus("ready",
+                '<i class="fas fa-check-circle"></i> FFmpeg ready');
+
+        } catch (err) {
+
+            setStatus("err",
+                '<i class="fas fa-exclamation-triangle"></i> FFmpeg unavailable — use WebM Fast');
+
+            this.ready = false;
         }
-        this.loading=false;
-        return this.ready
+
+        this.loading = false;
+        return this.ready;
     }
 
-    async doExport(format,bitrate){
-        const btn=document.getElementById('startExportBtn');
-        const bar=document.getElementById('exportProgress');
-        const fill=document.getElementById('exportProgressFill');
-        const txt=document.getElementById('exportProgressText');
-        const log=document.getElementById('exportLog');
-        btn.disabled=true;bar.style.display='block';fill.style.width='0';txt.textContent='0%';
-        log.style.display='block';log.textContent='';
+    async doExport(format, bitrate) {
 
-        try{
-            if(format==='webm-fast'){
-                btn.innerHTML='<i class="fas fa-spinner fa-spin"></i> Recording...';
-                await this._direct(bitrate,fill,txt,log)
-            }else{
-                btn.innerHTML='<i class="fas fa-spinner fa-spin"></i> Loading FFmpeg...';
-                const ok=await this.loadFFmpeg();
-                if(!ok){alert('FFmpeg not available. Use "WebM Fast".');return}
-                btn.innerHTML='<i class="fas fa-spinner fa-spin"></i> Rendering...';
-                await this._ffmpeg(format,bitrate,fill,txt,log)
+        const btn  = document.getElementById("startExportBtn");
+        const bar  = document.getElementById("exportProgress");
+        const fill = document.getElementById("exportProgressFill");
+        const txt  = document.getElementById("exportProgressText");
+        const log  = document.getElementById("exportLog");
+
+        btn.disabled = true;
+        bar.style.display = "block";
+        fill.style.width = "0%";
+        txt.textContent = "0%";
+        log.style.display = "block";
+        log.textContent = "";
+
+        try {
+
+            if (format === "webm-fast") {
+
+                btn.innerHTML =
+                    '<i class="fas fa-spinner fa-spin"></i> Recording...';
+
+                await this._direct(bitrate);
+
+            } else {
+
+                btn.innerHTML =
+                    '<i class="fas fa-spinner fa-spin"></i> Loading FFmpeg...';
+
+                const ok = await this.loadFFmpeg();
+                if (!ok) throw new Error("FFmpeg unavailable");
+
+                btn.innerHTML =
+                    '<i class="fas fa-spinner fa-spin"></i> Rendering...';
+
+                await this._ffmpeg(format, bitrate);
             }
-        }catch(err){alert('Export failed: '+err.message);console.error(err)}
-        finally{btn.disabled=false;btn.innerHTML='<i class="fas fa-download"></i> Start Export';setTimeout(()=>{bar.style.display='none';fill.style.width='0'},3000)}
+
+        } catch (err) {
+
+            alert("Export failed: " + (err?.message || err));
+
+        } finally {
+
+            btn.disabled = false;
+            btn.innerHTML =
+                '<i class="fas fa-download"></i> Start Export';
+
+            setTimeout(() => {
+                bar.style.display = "none";
+                fill.style.width = "0%";
+            }, 3000);
+        }
     }
 
-    async _direct(bitrate,fill,txt,log){
-        const app=this.app,canvas=app.renderer.canvas,fps=+document.getElementById('fpsSelect').value||30;
-        const duration=app.timeline.dur()-3;
-        const stream=canvas.captureStream(fps);
-        let mime='video/webm;codecs=vp9';
-        if(!MediaRecorder.isTypeSupported(mime))mime='video/webm;codecs=vp8';
-        if(!MediaRecorder.isTypeSupported(mime))mime='video/webm';
-        const rec=new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:bitrate});
-        const chunks=[];rec.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};
-        const done=new Promise(r=>{rec.onstop=r});
-        if(app.isPlaying)app.pause();rec.start(50);
-        log.textContent+=`Recording ${Math.ceil(duration)}s at ${fps}fps...\n`;
-        const tot=Math.ceil(duration*fps);
-        for(let f=0;f<=tot;f++){
-            app.currentTime=f/fps;app.renderer.renderFrame(app.currentTime,app.timeline.tracks,app.mediaAssets);
-            fill.style.width=Math.round(f/tot*100)+'%';txt.textContent=Math.round(f/tot*100)+'%';
-            if(f%3===0)await new Promise(r=>setTimeout(r,0))
+    async _direct(bitrate) {
+
+        const app = this.app;
+        const canvas = app.renderer.canvas;
+        const fps = +document.getElementById("fpsSelect").value || 30;
+
+        const duration = app.timeline.dur() - 3;
+        const totalFrames = Math.ceil(duration * fps);
+
+        const fill = document.getElementById("exportProgressFill");
+        const txt  = document.getElementById("exportProgressText");
+        const log  = document.getElementById("exportLog");
+
+        const stream = canvas.captureStream(fps);
+
+        const rec = new MediaRecorder(stream, {
+            mimeType: "video/webm",
+            videoBitsPerSecond: bitrate
+        });
+
+        const chunks = [];
+        rec.ondataavailable = e => {
+            if (e.data.size) chunks.push(e.data);
+        };
+
+        const stopped = new Promise(r => rec.onstop = r);
+
+        if (app.isPlaying) app.pause();
+
+        rec.start();
+
+        log.textContent +=
+            `Recording ${totalFrames} frames...\n`;
+
+        for (let f = 0; f <= totalFrames; f++) {
+
+            app.currentTime = f / fps;
+            app.renderer.renderFrame(
+                app.currentTime,
+                app.timeline.tracks,
+                app.mediaAssets
+            );
+
+            const pct =
+                Math.round((f / totalFrames) * 100);
+
+            fill.style.width = pct + "%";
+            txt.textContent = pct + "%";
+
+            if (f % 3 === 0)
+                await new Promise(r => setTimeout(r, 0));
         }
-        rec.stop();app._pauseAll();await done;
-        const blob=new Blob(chunks,{type:mime});this._dl(blob,'wasmforge_export.webm');
-        fill.style.width='100%';txt.textContent='Done!';log.textContent+=`Exported ${(blob.size/1048576).toFixed(1)}MB\n`
+
+        rec.stop();
+        await stopped;
+
+        const blob = new Blob(chunks, { type: "video/webm" });
+
+        this._download(blob, "wasmforge_export.webm");
+
+        txt.textContent = "Done!";
+        log.textContent +=
+            `Exported ${(blob.size / 1048576).toFixed(1)} MB\n`;
     }
 
-    async _ffmpeg(format,bitrate,fill,txt,log){
-        const app=this.app,canvas=app.renderer.canvas,fps=+document.getElementById('fpsSelect').value||30;
-        const duration=app.timeline.dur()-3,tot=Math.ceil(duration*fps);
-        if(app.isPlaying)app.pause();
-        log.textContent+=`Rendering ${tot} frames...\n`;
-        for(let f=0;f<=tot;f++){
-            app.currentTime=f/fps;app.renderer.renderFrame(app.currentTime,app.timeline.tracks,app.mediaAssets);
-            const blob=await new Promise(r=>canvas.toBlob(r,'image/png'));
-            const buf=await blob.arrayBuffer();
-            await this.ffmpeg.writeFile(`f${String(f).padStart(6,'0')}.png`,new Uint8Array(buf));
-            fill.style.width=Math.round(f/tot*50)+'%';txt.textContent=Math.round(f/tot*50)+'% frames';
-            if(f%4===0)await new Promise(r=>setTimeout(r,0))
+    // FFmpeg export using RAW RGBA frames (memory safe).
+    async _ffmpeg(format, bitrate) {
+
+        const app = this.app;
+        const canvas = app.renderer.canvas;
+        const ctx = canvas.getContext("2d");
+
+        const fps =
+            +document.getElementById("fpsSelect").value || 30;
+
+        const duration = app.timeline.dur() - 3;
+        const totalFrames = Math.ceil(duration * fps);
+
+        const fill = document.getElementById("exportProgressFill");
+        const txt  = document.getElementById("exportProgressText");
+        const log  = document.getElementById("exportLog");
+
+        if (app.isPlaying) app.pause();
+
+        log.textContent +=
+            `Rendering ${totalFrames} frames (RAW)...\n`;
+
+        // Memory guard estimate.
+        const estimated =
+            canvas.width * canvas.height * 4 * totalFrames;
+
+        if (estimated > 800 * 1024 * 1024) {
+            throw new Error(
+                "Export too large for browser memory. Reduce resolution or duration."
+            );
         }
-        app._pauseAll();fill.style.width='50%';txt.textContent='50% encoding...';log.textContent+='Encoding...\n';
-        const br=Math.round(bitrate/1000)+'k';let out,args;
-        switch(format){
-            case'mp4':out='out.mp4';args=['-framerate',`${fps}`,'-i','f%06d.png','-c:v','libx264','-pix_fmt','yuv420p','-b:v',br,'-preset','fast','-y',out];break;
-            case'webm-hq':out='out.webm';args=['-framerate',`${fps}`,'-i','f%06d.png','-c:v','libvpx','-b:v',br,'-pix_fmt','yuv420p','-y',out];break;
-            case'mov':out='out.mov';args=['-framerate',`${fps}`,'-i','f%06d.png','-c:v','libx264','-pix_fmt','yuv420p','-b:v',br,'-y',out];break;
-            case'avi':out='out.avi';args=['-framerate',`${fps}`,'-i','f%06d.png','-c:v','libx264','-pix_fmt','yuv420p','-b:v',br,'-y',out];break;
-            case'gif':out='out.gif';args=['-framerate',`${fps}`,'-i','f%06d.png','-vf',`fps=${Math.min(fps,15)},scale=480:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse`,'-y',out];break;
-            default:out='out.mp4';args=['-framerate',`${fps}`,'-i','f%06d.png','-c:v','libx264','-pix_fmt','yuv420p','-b:v',br,'-y',out]
+
+        // Write raw RGBA frames.
+        for (let f = 0; f <= totalFrames; f++) {
+
+            app.currentTime = f / fps;
+            app.renderer.renderFrame(
+                app.currentTime,
+                app.timeline.tracks,
+                app.mediaAssets
+            );
+
+            const imageData =
+                ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+            await this.ffmpeg.writeFile(
+                `frame${String(f).padStart(6, "0")}.raw`,
+                imageData.data
+            );
+
+            const pct =
+                Math.round((f / totalFrames) * 50);
+
+            fill.style.width = pct + "%";
+            txt.textContent = pct + "% frames";
+
+            if (f % 4 === 0)
+                await new Promise(r => setTimeout(r, 0));
         }
-        log.textContent+=`ffmpeg ${args.join(' ')}\n`;
+
+        fill.style.width = "50%";
+        txt.textContent = "Encoding...";
+
+        const br = Math.round(bitrate / 1000) + "k";
+        const out = "out.mp4";
+
+        const args = [
+            "-f", "rawvideo",
+            "-pix_fmt", "rgba",
+            "-s", `${canvas.width}x${canvas.height}`,
+            "-r", `${fps}`,
+            "-i", "frame%06d.raw",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-preset", "veryfast",
+            "-b:v", br,
+            "-y",
+            out
+        ];
+
         await this.ffmpeg.exec(args);
-        const result=await this.ffmpeg.readFile(out);
-        const mimes={mp4:'video/mp4','webm-hq':'video/webm',mov:'video/quicktime',avi:'video/x-msvideo',gif:'image/gif'};
-        const blob=new Blob([result.buffer],{type:mimes[format]||'application/octet-stream'});
-        for(let f=0;f<=tot;f++){try{await this.ffmpeg.deleteFile(`f${String(f).padStart(6,'0')}.png`)}catch(e){}}
-        try{await this.ffmpeg.deleteFile(out)}catch(e){}
-        const ext=format==='webm-hq'?'webm':format;
-        this._dl(blob,`wasmforge_export.${ext}`);
-        fill.style.width='100%';txt.textContent='Done!';log.textContent+=`Done! ${(blob.size/1048576).toFixed(1)}MB\n`
+
+        const data = await this.ffmpeg.readFile(out);
+
+        const blob = new Blob(
+            [data.buffer],
+            { type: "video/mp4" }
+        );
+
+        // Cleanup raw frames.
+        for (let f = 0; f <= totalFrames; f++) {
+            try {
+                await this.ffmpeg.deleteFile(
+                    `frame${String(f).padStart(6, "0")}.raw`
+                );
+            } catch {}
+        }
+
+        try { await this.ffmpeg.deleteFile(out); } catch {}
+
+        this._download(blob, "wasmforge_export.mp4");
+
+        fill.style.width = "100%";
+        txt.textContent = "Done!";
+        log.textContent +=
+            `Done! ${(blob.size / 1048576).toFixed(1)} MB\n`;
     }
 
-    _dl(blob,name){const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),10000)}
+    // Download blob util
+    _download(blob, name) {
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = name;
+        a.click();
+
+        setTimeout(() =>
+            URL.revokeObjectURL(a.href),
+            10000
+        );
+    }
 }
 
 // =====================================================================

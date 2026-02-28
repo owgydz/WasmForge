@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>FFmpeg Unit Test</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <style>
+        body {
+            background: #0f1115;
+            color: #e6edf3;
+            font-family: monospace;
+            margin: 0;
+            padding: 40px;
+        }
+
+        h1 {
+            margin-top: 0;
+            color: #4cc2ff;
+        }
+
+        button {
+            padding: 12px 20px;
+            font-size: 16px;
+            background: #4cc2ff;
+            border: none;
+            color: #000;
+            cursor: pointer;
+            border-radius: 6px;
+        }
+
+        button:hover {
+            opacity: 0.9;
+        }
+
+        #log {
+            margin-top: 30px;
+            background: #161b22;
+            padding: 20px;
+            border-radius: 8px;
+            white-space: pre-wrap;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .ok { color: #3fb950; }
+        .err { color: #f85149; }
+        .warn { color: #d29922; }
+    </style>
+</head>
+<body>
+
+<h1>FFmpeg.wasm Unit Test</h1>
+
+<p>This will validate:</p>
+<ul>
+    <li>FFmpeg script loads</li>
+    <li>Core loads</li>
+    <li>Filesystem works</li>
+    <li>PNG → MP4 encoding works</li>
+</ul>
+
+<button id="runBtn">Run FFmpeg Unit Test</button>
+
+<div id="log"></div>
+
+<script src="FFMpeg_unittest.js"></script>
+
+<script>
+    const logEl = document.getElementById('log')
+
+    function log(msg, cls = '') {
+        const div = document.createElement('div')
+        if (cls) div.className = cls
+        div.textContent = msg
+        logEl.appendChild(div)
+        logEl.scrollTop = logEl.scrollHeight
+    }
+
+    document.getElementById('runBtn').onclick = async () => {
+        logEl.innerHTML = ''
+        log('Starting FFmpeg unit test...')
+
+        try {
+            if (location.protocol === 'file:') {
+                throw new Error('Cannot run under file:// — use a local server')
+            }
+
+            if (!crossOriginIsolated) {
+                log('Warning: crossOriginIsolated = false', 'warn')
+            }
+
+            const test = new FFMpegUnitTest()
+
+            // override logger safely
+            test.log = (msg) => log(msg)
+
+            await test.run()
+
+            log('ALL TESTS PASSED', 'ok')
+
+        } catch (e) {
+            /* TODO: Fix it saying "test failed: undefined" even though the test succeeded */
+            log('TEST FAILED: ' + e.message, 'err') 
+        }
+    }
+</script>
