@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>WasmForge — Video Editor</title>
+    <script src="https://cdn.jsdelivr.net/npm/mp4box@0.5.3/dist/mp4box.all.min.js"></script>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎬</text></svg>">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
@@ -453,219 +454,347 @@ class TL {
     getState(){return{tracks:JSON.parse(JSON.stringify(this.tracks)),zoom:this.zoom,clipId:this.clipId}}
     loadState(s){this.tracks=s.tracks;this.zoom=s.zoom;this.clipId=s.clipId;this.selectedClip=null;this.render()}
 }
-// Export logger I made
-// View logs in Chrome DevTools
-class ExportLogger {
-
-    constructor() {
-        this.logs = [];
-        window.__WASMFORGE_EXPORT_LOG__ = this.logs;
-    }
-
-    _push(level, message) {
-        const entry = {
-            ts: performance.now().toFixed(2),
-            level,
-            message
-        };
-
-        this.logs.push(entry);
-
-        console[level](
-            `%c[Exporter ${entry.ts}ms]`,
-            "color:#4cc2ff;font-weight:bold",
-            message
-        );
-    }
-
-    info(msg)  { this._push("log", msg); }
-    warn(msg)  { this._push("warn", msg); }
-    error(msg) { this._push("error", msg); }
-
-    dump() {
-        console.table(this.logs);
-    }
-}
-
-
 class Exporter {
-
     constructor(app) {
-        this.app = app;
-        this.logger = new ExportLogger();
-        this.worker = null;
-        this.cancelled = false;
-        // Do not fetch, use ffmpeg in third_party
-        this.basePath = "/third_party/ffmpeg";
-        this.memoryBudget = this.detectMemoryBudget();
+        this.app = app
+        this.ffmpeg = null
+        this.ffmpegLoaded = false
+        this.basePath = '/third_party/ffmpeg'
+        this.verbose = true
+        this.cancelled = false
     }
 
-    detectMemoryBudget() {
-        const deviceMemory = navigator.deviceMemory || 4;
+    log(...args) {
+        if (!this.verbose) return
+        console.log('[Exporter]', ...args)
 
-        // Allocate conservative percentage of device memory
-        const budgetMB = Math.min(deviceMemory * 256, 512);
-        const budget = budgetMB * 1024 * 1024;
-
-        this.logger.info(`Detected device memory: ${deviceMemory}GB`);
-        this.logger.info(`Using memory budget: ${budgetMB}MB`);
-
-        return budget;
-    }
-
-    cancel() {
-        this.logger.warn("Export cancellation requested.");
-        this.cancelled = true;
-
-        if (this.worker) {
-            this.worker.terminate();
-            this.worker = null;
-            this.logger.warn("Worker terminated.");
+        const el = document.getElementById('devtoolsLog')
+        if (el) {
+            el.textContent += args.join(' ') + '\n'
+            el.scrollTop = el.scrollHeight
         }
     }
 
-    async initWorker() {
-        if (this.worker) return;
-
-        this.logger.info("Spawning FFmpeg worker...");
-
-        this.worker = new Worker(
-            `${this.basePath}/ffmpeg_worker.js`
-        );
-
-        await new Promise(resolve => {
-
-            this.worker.onmessage = (e) => {
-                if (e.data.type === "ready") {
-                    this.logger.info("Worker ready.");
-                    resolve();
-                }
-            };
-
-            this.worker.postMessage({
-                type: "init",
-                payload: {
-                    coreURL: `${this.basePath}/ffmpeg-core.js`,
-                    wasmURL: `${this.basePath}/ffmpeg-core.wasm`
-                }
-            });
-        });
+    cancel() {
+        this.cancelled = true
+        this.log('Export cancelled')
     }
 
-    computeChunkSize(width, height) {
-        const bytesPerFrame = width * height * 4;
-        let frames = Math.floor(this.memoryBudget / bytesPerFrame);
+    async doExport(format, bitrate) {
+        this.cancelled = false
+        this._initProgress()
 
-        frames = Math.max(30, frames);
-        frames = Math.min(240, frames);
+        this.log('Export format:', format)
 
-        this.logger.info(`Adaptive chunk size: ${frames} frames`);
-        return frames;
+        if (format === 'webm')
+            return this._exportWebM(bitrate)
+
+        if (format === 'mp4' && this._supportsWebCodecs())
+            return this._exportMP4WebCodecs(bitrate)
+
+        this.log('Using FFmpeg fallback')
+        await this._loadFFmpeg()
+        return this._exportWithFFmpeg(format, bitrate)
     }
 
-    async exportMP4(bitrate) {
-        this.cancelled = false;
-        await this.initWorker();
+    async _exportWebM(bitrate) {
+        this.log('MediaRecorder path')
 
-        const app = this.app;
-        const canvas = app.renderer.canvas;
-        const ctx = canvas.getContext("2d");
+        const canvas = this.app.renderer.canvas
+        const fps = +document.getElementById('fpsSelect').value || 30
+        const duration = this.app.timeline.dur() - 3
 
-        const fps =
-            +document.getElementById("fpsSelect").value || 30;
+        const stream = canvas.captureStream(fps)
 
-        const duration = app.timeline.dur() - 3;
-        const totalFrames = Math.ceil(duration * fps);
+        const recorder = new MediaRecorder(stream, {
+            mimeType: 'video/webm;codecs=vp9',
+            videoBitsPerSecond: bitrate
+        })
 
-        const chunkSize =
-            this.computeChunkSize(
-                canvas.width,
-                canvas.height
-            );
+        const chunks = []
+        recorder.ondataavailable = e => e.data.size && chunks.push(e.data)
 
-        let chunkIndex = 0;
-        let frames = [];
+        recorder.start()
+        await this._renderTimeline(fps, duration)
+        recorder.stop()
 
-        this.logger.info(
-            `Starting export: ${totalFrames} frames`
-        );
+        await new Promise(r => recorder.onstop = r)
+
+        const blob = new Blob(chunks, { type: 'video/webm' })
+        this._finish(blob, 'export.webm')
+    }
+
+    async _exportMP4WebCodecs(bitrate) {
+        this.log('WebCodecs MP4 path')
+
+        const app = this.app
+        const canvas = app.renderer.canvas
+        const ctx = canvas.getContext('2d', { willReadFrequently: true })
+
+        const fps = +document.getElementById('fpsSelect').value || 30
+        const duration = app.timeline.dur() - 3
+        const totalFrames = Math.ceil(duration * fps)
+
+        const width = canvas.width
+        const height = canvas.height
+
+        const codec = this._getAVCCodec(width, height)
+
+        const chunks = []
+
+        const encoder = new VideoEncoder({
+            output: chunk => chunks.push(chunk),
+            error: e => this.log('Encoder error:', e)
+        })
+
+        encoder.configure({
+            codec,
+            width,
+            height,
+            bitrate,
+            framerate: fps
+        })
+
+        const startTime = performance.now()
 
         for (let f = 0; f < totalFrames; f++) {
 
-            if (this.cancelled) {
-                this.logger.warn("Encoding cancelled.");
-                return;
-            }
+            if (this.cancelled) break
 
-            app.currentTime = f / fps;
+            app.currentTime = f / fps
             app.renderer.renderFrame(
                 app.currentTime,
                 app.timeline.tracks,
                 app.mediaAssets
-            );
+            )
 
-            const imageData =
-                ctx.getImageData(
-                    0,
-                    0,
-                    canvas.width,
-                    canvas.height
-                );
+            const frame = new VideoFrame(canvas, {
+                timestamp: (f / fps) * 1e6
+            })
 
-            frames.push(new Uint8Array(imageData.data));
+            encoder.encode(frame)
+            frame.close()
 
-            if (
-                frames.length >= chunkSize ||
-                f === totalFrames - 1
-            ) {
+            this._updateProgress(f + 1, totalFrames, startTime)
 
-                await this.encodeChunk(
-                    frames,
-                    canvas.width,
-                    canvas.height,
-                    fps,
-                    chunkIndex,
-                    bitrate
-                );
-
-                frames = [];
-                chunkIndex++;
-            }
-
-            if (f % 10 === 0)
-                await new Promise(r => setTimeout(r, 0));
+            if (f % 2 === 0)
+                await new Promise(r => setTimeout(r, 0))
         }
 
-        this.logger.info("All chunks encoded successfully.");
+        await encoder.flush()
+        encoder.close()
+
+        const blob = new Blob(
+            chunks.map(c => {
+                const arr = new Uint8Array(c.byteLength)
+                c.copyTo(arr)
+                return arr
+            }),
+            { type: 'video/mp4' }
+        )
+
+        this._finish(blob, 'export.mp4')
     }
-    // Encode chunks, this should help with memory/etc.
-    encodeChunk(frames, width, height, fps, index, bitrate) {
 
-        return new Promise(resolve => {
+    async _loadFFmpeg() {
+        if (this.ffmpegLoaded) return
 
-            this.worker.onmessage = (e) => {
+        this.log('Loading FFmpeg...')
 
-                if (e.data.type === "log")
-                    this.logger.info(e.data.message);
+        if (!window.FFmpegWASM && !window.FFmpeg) {
+            await new Promise((resolve, reject) => {
+                const s = document.createElement('script')
+                s.src = `${this.basePath}/ffmpeg.js`
+                s.onload = resolve
+                s.onerror = reject
+                document.head.appendChild(s)
+            })
+        }
 
-                if (e.data.type === "chunkComplete") {
-                    this.logger.info(`Chunk ${index} complete`);
-                    resolve();
-                }
-            };
+        const { FFmpeg } = window.FFmpegWASM || window
+        this.ffmpeg = new FFmpeg()
 
-            this.worker.postMessage({
-                type: "encodeChunk",
-                payload: {
-                    frames,
-                    width,
-                    height,
-                    fps,
-                    index,
-                    bitrate
-                }
-            });
-        });
+        await this.ffmpeg.load({
+            coreURL: `${this.basePath}/ffmpeg-core.js`,
+            wasmURL: `${this.basePath}/ffmpeg-core.wasm`
+        })
+
+        this.ffmpegLoaded = true
+        this.log('FFmpeg ready')
+    }
+
+    async _exportWithFFmpeg(format, bitrate) {
+
+        const app = this.app
+        const canvas = app.renderer.canvas
+        const ctx = canvas.getContext('2d', { willReadFrequently: true })
+
+        const fps = +document.getElementById('fpsSelect').value || 30
+        const duration = app.timeline.dur() - 3
+        const totalFrames = Math.ceil(duration * fps)
+
+        const width = canvas.width
+        const height = canvas.height
+        const frameSize = width * height * 4
+
+        const CHUNK = 4
+        let chunkBuffer = new Uint8Array(frameSize * CHUNK)
+        let chunkIndex = 0
+
+        await this.ffmpeg.writeFile('input.raw', new Uint8Array(0))
+
+        const startTime = performance.now()
+
+        for (let f = 0; f < totalFrames; f++) {
+
+            if (this.cancelled) break
+
+            app.currentTime = f / fps
+            app.renderer.renderFrame(
+                app.currentTime,
+                app.timeline.tracks,
+                app.mediaAssets
+            )
+
+            const imageData = ctx.getImageData(0, 0, width, height)
+            chunkBuffer.set(imageData.data, chunkIndex * frameSize)
+            chunkIndex++
+
+            if (chunkIndex === CHUNK || f === totalFrames - 1) {
+
+                const slice = chunkBuffer.subarray(0, chunkIndex * frameSize)
+
+                let existing = new Uint8Array(0)
+                try {
+                    existing = await this.ffmpeg.readFile('input.raw')
+                } catch {}
+
+                const combined = new Uint8Array(existing.length + slice.length)
+                combined.set(existing)
+                combined.set(slice, existing.length)
+
+                await this.ffmpeg.writeFile('input.raw', combined)
+                chunkIndex = 0
+            }
+
+            this._updateProgress(f + 1, totalFrames, startTime)
+
+            if (f % 2 === 0)
+                await new Promise(r => setTimeout(r, 0))
+        }
+
+        const output = format === 'gif' ? 'out.gif' : `out.${format}`
+
+        const args = [
+            '-f', 'rawvideo',
+            '-pixel_format', 'rgba',
+            '-video_size', `${width}x${height}`,
+            '-framerate', `${fps}`,
+            '-i', 'input.raw'
+        ]
+
+        if (format === 'gif') {
+            args.push('-vf', `fps=${Math.min(fps,15)},scale=480:-1:flags=lanczos`)
+        } else {
+            args.push('-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-b:v', `${Math.round(bitrate/1000)}k`)
+        }
+
+        args.push('-y', output)
+
+        this.log('FFmpeg args:', args.join(' '))
+
+        await this.ffmpeg.exec(args)
+
+        const data = await this.ffmpeg.readFile(output)
+
+        await this.ffmpeg.deleteFile('input.raw')
+        await this.ffmpeg.deleteFile(output)
+
+        const mime = format === 'gif' ? 'image/gif' : 'video/mp4'
+        const blob = new Blob([data.buffer], { type: mime })
+
+        this._finish(blob, `export.${format}`)
+    }
+
+    async _renderTimeline(fps, duration) {
+        const totalFrames = Math.ceil(duration * fps)
+        const startTime = performance.now()
+
+        for (let f = 0; f < totalFrames; f++) {
+            if (this.cancelled) break
+
+            this.app.currentTime = f / fps
+            this.app.renderer.renderFrame(
+                this.app.currentTime,
+                this.app.timeline.tracks,
+                this.app.mediaAssets
+            )
+
+            this._updateProgress(f + 1, totalFrames, startTime)
+
+            if (f % 2 === 0)
+                await new Promise(r => setTimeout(r, 0))
+        }
+    }
+
+    _initProgress() {
+        const bar = document.getElementById('exportProgress')
+        const fill = document.getElementById('exportProgressFill')
+        const text = document.getElementById('exportProgressText')
+
+        if (bar) bar.style.display = 'block'
+        if (fill) fill.style.width = '0%'
+        if (text) text.textContent = 'Starting...'
+    }
+
+    _updateProgress(current, total, startTime) {
+        const fill = document.getElementById('exportProgressFill')
+        const text = document.getElementById('exportProgressText')
+
+        const now = performance.now()
+        const elapsed = (now - startTime) / 1000
+        const progress = current / total
+        const fpsNow = current / elapsed
+        const eta = (total - current) / fpsNow
+
+        if (fill)
+            fill.style.width = (progress * 100).toFixed(1) + '%'
+
+        if (text)
+            text.textContent =
+                `${(progress * 100).toFixed(1)}% | FPS ${fpsNow.toFixed(1)} | ETA ${eta.toFixed(1)}s`
+    }
+
+    _finish(blob, name) {
+        this.log('Download:', name)
+        this._download(blob, name)
+
+        const fill = document.getElementById('exportProgressFill')
+        const text = document.getElementById('exportProgressText')
+
+        if (fill) fill.style.width = '100%'
+        if (text) text.textContent = 'Done'
+    }
+
+    _download(blob, name) {
+        const a = document.createElement('a')
+        a.href = URL.createObjectURL(blob)
+        a.download = name
+        a.click()
+        setTimeout(() => URL.revokeObjectURL(a.href), 10000)
+    }
+
+    _supportsWebCodecs() {
+        return 'VideoEncoder' in window
+    }
+
+    _getAVCCodec(width, height) {
+        const area = width * height
+        if (area <= 414720) return 'avc1.42E01E'
+        if (area <= 921600) return 'avc1.4D401F'
+        if (area <= 2073600) return 'avc1.640028'
+        if (area <= 3686400) return 'avc1.64002A'
+        return 'avc1.640033'
     }
 }
 
@@ -787,7 +916,7 @@ class WasmForge {
         document.getElementById('closeExportModal').onclick=()=>{document.getElementById('exportModal').style.display='none'};
         document.getElementById('exportModal').onclick=e=>{if(e.target.id==='exportModal')e.target.style.display='none'};
         document.querySelectorAll('.format-card').forEach(c=>{c.onclick=()=>{document.querySelectorAll('.format-card').forEach(x=>x.classList.remove('active'));c.classList.add('active');selFmt=c.dataset.format}});
-        document.getElementById('startExportBtn').onclick=()=>{this.exporter.doExport(selFmt,+document.getElementById('exportQuality').value)};
+        document.getElementById('startExportBtn').onclick = (() => { const exporter = this.exporter; return () => exporter.doExport(selFmt, +document.getElementById('exportQuality').value) })();
         document.body.ondragover=e=>e.preventDefault();document.body.ondrop=e=>e.preventDefault()
     }
 }
